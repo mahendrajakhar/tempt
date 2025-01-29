@@ -52,7 +52,7 @@ def generate_music(
     # Check requirements first
     requirement_messages = check_requirements()
     if requirement_messages:
-        return gr.Error("\n".join(requirement_messages))
+        raise gr.Error("\n".join(requirement_messages))
     
     progress(0, desc="Creating temporary files...")
     
@@ -88,7 +88,7 @@ def generate_music(
             cmd.extend(["--stage1_model", "m-a-p/YuE-s1-7B-anneal-en-cot"])
         else:  # ICL mode
             if not audio_prompt:
-                return gr.Error("Reference audio is required for ICL mode")
+                raise gr.Error("Reference audio is required for ICL mode")
             cmd.extend([
                 "--stage1_model", "m-a-p/YuE-s1-7B-anneal-en-icl",
                 "--audio_prompt_path", audio_prompt.name,
@@ -113,16 +113,18 @@ def generate_music(
             output_files = os.listdir("inference/output")
             audio_files = [f for f in output_files if f.endswith('.wav')]
             if audio_files:
-                return os.path.join("inference/output", audio_files[-1])
+                return os.path.join("inference/output", audio_files[-1]), None
             else:
-                return gr.Error("No audio file was generated")
+                raise gr.Error("No audio file was generated")
                 
         except subprocess.CalledProcessError as e:
             error_msg = f"Error during music generation:\n{e.stderr}"
-            return gr.Error(error_msg)
+            raise gr.Error(error_msg)
             
     except Exception as e:
-        return gr.Error(f"An error occurred: {str(e)}")
+        if isinstance(e, gr.Error):
+            raise e
+        raise gr.Error(f"An error occurred: {str(e)}")
     finally:
         # Cleanup temporary files
         try:
@@ -215,6 +217,7 @@ def create_interface():
             with gr.Column():
                 generate_btn = gr.Button("Generate Music", variant="primary")
                 output_audio = gr.Audio(label="Generated Music")
+                error_output = gr.Markdown(visible=False)
 
         # Show/hide ICL options based on mode
         mode.change(
@@ -237,7 +240,7 @@ def create_interface():
                 prompt_start,
                 prompt_end
             ],
-            outputs=output_audio
+            outputs=[output_audio, error_output]
         )
 
     return interface
