@@ -3,10 +3,39 @@ import subprocess
 import os
 import json
 import tempfile
+import sys
+from pathlib import Path
+
+def check_requirements():
+    """Check if all requirements are met"""
+    messages = []
+    
+    # Check if git-lfs is installed
+    try:
+        subprocess.run(['git', 'lfs', 'version'], check=True, capture_output=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        messages.append("Git LFS is not installed. Please install it using:\n"
+                       "apt-get install git-lfs && git lfs install")
+    
+    # Check if model files are downloaded
+    semantic_ckpt_path = Path("inference/xcodec_mini_infer/semantic_ckpts/hf_1_325000")
+    if not semantic_ckpt_path.exists():
+        messages.append("Model checkpoints not found. Please run:\n"
+                       "git lfs install && git lfs pull")
+    
+    # Check CUDA availability
+    import torch
+    if not torch.cuda.is_available():
+        messages.append("CUDA is not available. GPU is required for this model.")
+    
+    return messages
 
 def load_top_200_tags():
-    with open('top_200_tags.json', 'r') as f:
-        return json.load(f)
+    try:
+        with open('top_200_tags.json', 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return ["pop", "rock", "electronic"]  # Default fallback tags
 
 def generate_music(
     mode,
@@ -17,56 +46,90 @@ def generate_music(
     max_new_tokens,
     audio_prompt=None,
     prompt_start_time=0,
-    prompt_end_time=30
+    prompt_end_time=30,
+    progress=gr.Progress()
 ):
+    # Check requirements first
+    requirement_messages = check_requirements()
+    if requirement_messages:
+        return gr.Error("\n".join(requirement_messages))
+    
+    progress(0, desc="Creating temporary files...")
+    
     # Create temporary files for genre and lyrics
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as genre_file:
-        genre_file.write(genre_tags)
-        genre_path = genre_file.name
-        
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as lyrics_file:
-        lyrics_file.write(lyrics)
-        lyrics_path = lyrics_file.name
-
-    # Base command
-    cmd = [
-        "python", "infer.py",
-        "--stage2_model", "m-a-p/YuE-s2-1B-general",
-        "--genre_txt", genre_path,
-        "--lyrics_txt", lyrics_path,
-        "--run_n_segments", str(run_n_segments),
-        "--stage2_batch_size", str(stage2_batch_size),
-        "--output_dir", "./output",
-        "--cuda_idx", "0",
-        "--max_new_tokens", str(max_new_tokens)
-    ]
-
-    # Add model based on mode
-    if mode == "Chain of Thought (CoT)":
-        cmd.extend(["--stage1_model", "m-a-p/YuE-s1-7B-anneal-en-cot"])
-    else:  # ICL mode
-        cmd.extend([
-            "--stage1_model", "m-a-p/YuE-s1-7B-anneal-en-icl",
-            "--audio_prompt_path", audio_prompt.name if audio_prompt else "",
-            "--prompt_start_time", str(prompt_start_time),
-            "--prompt_end_time", str(prompt_end_time)
-        ])
-
     try:
-        # Run the command
-        subprocess.run(cmd, check=True, cwd="inference")
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as genre_file:
+            genre_file.write(genre_tags)
+            genre_path = genre_file.name
+            
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as lyrics_file:
+            lyrics_file.write(lyrics)
+            lyrics_path = lyrics_file.name
+
+        # Ensure output directory exists
+        os.makedirs("inference/output", exist_ok=True)
+
+        # Base command
+        cmd = [
+            sys.executable,  # Use the current Python interpreter
+            "infer.py",
+            "--stage2_model", "m-a-p/YuE-s2-1B-general",
+            "--genre_txt", genre_path,
+            "--lyrics_txt", lyrics_path,
+            "--run_n_segments", str(run_n_segments),
+            "--stage2_batch_size", str(stage2_batch_size),
+            "--output_dir", "./output",
+            "--cuda_idx", "0",
+            "--max_new_tokens", str(max_new_tokens)
+        ]
+
+        # Add model based on mode
+        if mode == "Chain of Thought (CoT)":
+            cmd.extend(["--stage1_model", "m-a-p/YuE-s1-7B-anneal-en-cot"])
+        else:  # ICL mode
+            if not audio_prompt:
+                return gr.Error("Reference audio is required for ICL mode")
+            cmd.extend([
+                "--stage1_model", "m-a-p/YuE-s1-7B-anneal-en-icl",
+                "--audio_prompt_path", audio_prompt.name,
+                "--prompt_start_time", str(prompt_start_time),
+                "--prompt_end_time", str(prompt_end_time)
+            ])
+
+        progress(0.2, desc="Starting music generation...")
         
-        # Find the generated audio file in output directory
-        output_files = os.listdir("inference/output")
-        audio_files = [f for f in output_files if f.endswith('.wav')]
-        if audio_files:
-            return os.path.join("inference/output", audio_files[-1])
-        else:
-            return "No audio file generated"
+        # Run the command
+        try:
+            process = subprocess.run(
+                cmd, 
+                check=True, 
+                cwd="inference",
+                capture_output=True,
+                text=True
+            )
+            progress(0.8, desc="Processing output...")
+            
+            # Find the generated audio file in output directory
+            output_files = os.listdir("inference/output")
+            audio_files = [f for f in output_files if f.endswith('.wav')]
+            if audio_files:
+                return os.path.join("inference/output", audio_files[-1])
+            else:
+                return gr.Error("No audio file was generated")
+                
+        except subprocess.CalledProcessError as e:
+            error_msg = f"Error during music generation:\n{e.stderr}"
+            return gr.Error(error_msg)
+            
+    except Exception as e:
+        return gr.Error(f"An error occurred: {str(e)}")
     finally:
         # Cleanup temporary files
-        os.unlink(genre_path)
-        os.unlink(lyrics_path)
+        try:
+            os.unlink(genre_path)
+            os.unlink(lyrics_path)
+        except:
+            pass
 
 def create_interface():
     # Load available tags
@@ -75,6 +138,14 @@ def create_interface():
     with gr.Blocks(title="YuE Music Generation") as interface:
         gr.Markdown("# YuE Music Generation Interface")
         gr.Markdown("Generate music from lyrics using YuE model")
+        
+        # Add system status
+        status_messages = check_requirements()
+        if status_messages:
+            with gr.Box(variant="stop"):
+                gr.Markdown("### ⚠️ System Requirements Not Met")
+                for msg in status_messages:
+                    gr.Markdown(f"- {msg}")
         
         with gr.Row():
             with gr.Column():
@@ -174,5 +245,6 @@ def create_interface():
 if __name__ == "__main__":
     interface = create_interface()
     interface.launch(
-        share=True
-        ) 
+        share=True,
+        server_name="0.0.0.0"
+    ) 
