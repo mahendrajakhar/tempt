@@ -6,6 +6,21 @@ import tempfile
 import sys
 from pathlib import Path
 
+def check_cuda_setup():
+    """Check CUDA setup and return appropriate device"""
+    import torch
+    if not torch.cuda.is_available():
+        return None, "CUDA is not available. GPU is required for this model."
+    
+    try:
+        # Test CUDA memory allocation
+        device = torch.device('cuda')
+        test_tensor = torch.zeros((1, 1)).to(device)
+        del test_tensor
+        return device, None
+    except Exception as e:
+        return None, f"CUDA error: {str(e)}"
+
 def check_requirements():
     """Check if all requirements are met"""
     messages = []
@@ -23,10 +38,10 @@ def check_requirements():
         messages.append("Model checkpoints not found. Please run:\n"
                        "git lfs install && git lfs pull")
     
-    # Check CUDA availability
-    import torch
-    if not torch.cuda.is_available():
-        messages.append("CUDA is not available. GPU is required for this model.")
+    # Check CUDA setup
+    _, cuda_error = check_cuda_setup()
+    if cuda_error:
+        messages.append(cuda_error)
     
     return messages
 
@@ -54,9 +69,18 @@ def generate_music(
     if requirement_messages:
         raise gr.Error("\n".join(requirement_messages))
     
+    if not genre_tags.strip():
+        raise gr.Error("Genre tags cannot be empty")
+    
+    if not lyrics.strip():
+        raise gr.Error("Lyrics cannot be empty")
+    
     progress(0, desc="Creating temporary files...")
     
     # Create temporary files for genre and lyrics
+    genre_path = None
+    lyrics_path = None
+    
     try:
         with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as genre_file:
             genre_file.write(genre_tags)
@@ -67,9 +91,21 @@ def generate_music(
             lyrics_path = lyrics_file.name
 
         # Ensure output directory exists
-        os.makedirs("inference/output", exist_ok=True)
+        output_dir = Path("inference/output")
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Base command
+        # Clean previous output files
+        for file in output_dir.glob("*.wav"):
+            try:
+                file.unlink()
+            except:
+                pass
+
+        # Base command with environment variables
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = "0"
+        env["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
+
         cmd = [
             sys.executable,  # Use the current Python interpreter
             "infer.py",
@@ -105,20 +141,22 @@ def generate_music(
                 check=True, 
                 cwd="inference",
                 capture_output=True,
-                text=True
+                text=True,
+                env=env
             )
             progress(0.8, desc="Processing output...")
             
             # Find the generated audio file in output directory
-            output_files = os.listdir("inference/output")
-            audio_files = [f for f in output_files if f.endswith('.wav')]
-            if audio_files:
-                return os.path.join("inference/output", audio_files[-1]), None
+            output_files = list(output_dir.glob("*.wav"))
+            if output_files:
+                return str(output_files[-1]), None
             else:
                 raise gr.Error("No audio file was generated")
                 
         except subprocess.CalledProcessError as e:
             error_msg = f"Error during music generation:\n{e.stderr}"
+            if "CUDA out of memory" in error_msg:
+                error_msg += "\n\nTry reducing the batch size or number of segments."
             raise gr.Error(error_msg)
             
     except Exception as e:
@@ -127,11 +165,12 @@ def generate_music(
         raise gr.Error(f"An error occurred: {str(e)}")
     finally:
         # Cleanup temporary files
-        try:
-            os.unlink(genre_path)
-            os.unlink(lyrics_path)
-        except:
-            pass
+        for path in [genre_path, lyrics_path]:
+            if path and os.path.exists(path):
+                try:
+                    os.unlink(path)
+                except:
+                    pass
 
 def create_interface():
     # Load available tags
